@@ -1,288 +1,271 @@
-#!/bin/bash
+#!/usr/bin/python3
 
-available() {
-  command -v "$1" > /dev/null
-}
+import subprocess
+import sys
+import os
+import shutil
+import tempfile
 
-select_container_manager() {
-  if available podman; then
-    conman_bin="podman"
-    return 0
-  elif available docker; then
-    conman_bin="docker"
-    return 0
-  fi
 
-  conman_bin="podman"
-}
+def available(command):
+    return shutil.which(command) is not None
 
-image_available() {
-  [ -n "$("${conman[@]}" images -q "$image_name" 2> /dev/null)" ]
-}
 
-wcurl() {
-  local wcurl_cmd=("curl" "--globoff" "--location" "--proto-default" "https")
-  wcurl_cmd+=("--remote-time" "--retry" "10" "--retry-max-time" "10" "$url")
-  "${wcurl_cmd[@]}"
-}
+def select_container_manager():
+    if available("podman"):
+        return "podman"
+    elif available("docker"):
+        return "docker"
 
-check_if_in_hf_db() {
-  local host="raw.githubusercontent.com"
-  local url="https://$host/ericcurtin/podman-llm/main/hf-db/$image_name"
-  local image_data
-  if ! image_available && image_data="$(wcurl)"; then
-    local hf_repo
-    hf_repo="$(echo "$image_data" | sed -ne "s/^hf-repo\s//pg" | xargs)"
-    local model
-    model="$(echo "$image_data" | sed -ne "s/^model\s//pg" | xargs)"
-    local containerfile="FROM quay.io/podman-llm/podman-llm:latest
-RUN huggingface-cli download $hf_repo $model
-RUN ln -s \$(huggingface-cli download $hf_repo $model) /models/$model
-LABEL MODEL=/models/$model"
-    echo "$containerfile" | "${conman[@]}" build "$vol" -t "$image_name" -
-  fi
-}
+    return "podman"
 
-get_model() {
-  "${conman[@]}" inspect -f '{{ index .Config.Labels "MODEL"}}' "$image_name"
-}
 
-get_dangling_images() {
-  "${conman[@]}" images --filter "dangling=true" -q --no-trunc
-}
+def image_available(conman, image_name):
+    images = conman.copy()
+    images.extend(["images", "-q", image_name])
+    result = subprocess.run(images,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return bool(result.stdout.strip())
 
-rm_dir() {
-  xargs dirname
-}
 
-get_model_dir() {
-  "${conman_run[@]}" "$image_name" readlink -f "$model" | rm_dir | rm_dir
-}
+def wcurl(url):
+    wcurl_cmd = ["curl", "--globoff", "--location", "--proto-default",
+                 "https", "--remote-time", "--retry", "10", "--retry-max-time", "10", url]
+    result = subprocess.run(
+        wcurl_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return result.stdout.decode('utf-8')
 
-add_dri() {
-  if [ -e "/dev/dri" ]; then
-    conman_run+=("--device" "/dev/dri")
-  fi
-}
 
-run_prep() {
-  local host_hf="$HOME/.cache/huggingface/"
-  mkdir -p "$host_hf"
-  vol="-v$host_hf:/root/.cache/huggingface/:z"
-  conman_run=("${conman[@]}" "run" "--rm" "-it")
-  conman_run+=("--security-opt=label=disable" "-v$HOME:$HOME" "-v/tmp:/tmp")
-  conman_run+=("$vol")
+def check_if_in_hf_db(conman, conman_run, vol, image_name):
+    host = "raw.githubusercontent.com"
+    url = f"https://{host}/ericcurtin/podman-llm/main/hf-db/{image_name}"
+    if not image_available(conman, image_name):
+        image_data = wcurl(url)
+        if image_data:
+            hf_repo = [line.split()[1] for line in image_data.splitlines()
+                       if line.startswith("hf-repo")][0]
+            model = [line.split()[1] for line in image_data.splitlines()
+                     if line.startswith("model")][0]
+            containerfile = (
+                f"FROM quay.io/podman-llm/podman-llm:latest\n"
+                f"RUN huggingface-cli download {hf_repo} {model}\n"
+                f"RUN ln -s $(huggingface-cli download {
+                    hf_repo} {model}) /models/{model}\n"
+                f"LABEL MODEL=/models/{model}"
+            )
+            with tempfile.NamedTemporaryFile(mode='w', delete=False) as tmpfile:
+                tmpfile.write(containerfile)
+            subprocess.run([conman, "build", vol, "-t",
+                           image_name, tmpfile.name])
 
-  if [ -e "/proc/driver/nvidia/gpus" ] || available nvidia-smi; then
-    conman_run+=("--gpus=all" "--device" "nvidia.com/gpu=all")
-  elif [ -e "/dev/kfd" ]; then
-    for i in /sys/bus/pci/devices/*/mem_info_vram_total; do
-      # AMD GPU needs more than 512M VRAM
-      if [ "$(< "$i")" -gt "600000000" ]; then
-        conman_run+=("--device" "/dev/kfd")
-        add_dri
-        ngl="true"
-        break
-      fi
-    done
-  elif [ "$(uname -m)" = "aarch64" ]; then # Don't do this on x86_64, slow perf
-    add_dri
-    ngl="true"
-  fi
-}
 
-rm_cli() {
-  local image_name="$1"
-  local model
-  model="$(get_model)"
+def get_model(conman, image_name):
+    inspect = conman.copy()
+    inspect.extend(
+        ["inspect", "-f", '{{ index .Config.Labels "MODEL"}}', image_name])
+    result = subprocess.run(
+        inspect, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return result.stdout.decode('utf-8').strip()
 
-  # To be completed, only delete the directory once all associated images, 3b,
-  # latest, etc. are removed
-  if false; then
-    local dir_to_rm
-    dir_to_rm=$(get_model_dir)
-    "${conman_run[@]}" "$image_name" rm -rf "$dir_to_rm" || true
-  fi
 
-  "${conman[@]}" rmi -f "$image_name"
-  get_dangling_images | xargs -r "${conman[@]}" rmi -f
-}
+def get_dangling_images(conman):
+    result = subprocess.run([conman, "images", "--filter", "dangling=true",
+                            "-q", "--no-trunc"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return result.stdout.decode('utf-8').splitlines()
 
-build_cli() {
-  local image_name="$1"
 
-  run_prep
-  exec "${conman[@]}" build "$vol" -t "$image_name" .
-}
+def rm_dir(path):
+    return os.path.dirname(path)
 
-serve_cli() {
-  shift 1
-  if [ "$#" -lt 1 ]; then
-    serve_usage
-  fi
 
-  local dryrun="false"
-  while [ $# -gt 0 ]; do
-    case $1 in
-      -d|--dryrun)
-        dryrun="true"
-        shift 1
-        ;;
-      -*)
-        serve_usage
-        ;;
-      *)
-        local image_name="$1"
-        shift # past argument
-        ;;
-    esac
-  done
+def get_model_dir(conman_run, image_name, model):
+    result = subprocess.run([*conman_run, image_name, "readlink",
+                            "-f", model], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return rm_dir(rm_dir(result.stdout.decode('utf-8').strip()))
 
-  run_prep
-  check_if_in_hf_db
-  local model
-  model="$(get_model)"
-  conman_run+=("-p" "${PODMAN_LLM_HOST:-8080}:8080" "$image_name")
-  conman_run+=("llama-server" "-m" "$model")
-  if $dryrun; then
-    echo "${conman_run[@]}"
-    return 0
-  fi
 
-  exec "${conman_run[@]}"
-}
+def add_dri(conman_run):
+    if os.path.exists("/dev/dri"):
+        conman_run.extend(["--device", "/dev/dri"])
 
-get_llm_store() {
-  if [ "$EUID" -eq 0 ]; then
-    llm_store="/var/lib/podman-llm/storage"
-    return 0
-  fi
 
-  llm_store="$HOME/.local/share/podman-llm/storage"
-}
+def run_prep(conman):
+    host_hf = os.path.expanduser("~/.cache/huggingface/")
+    os.makedirs(host_hf, exist_ok=True)
+    vol = f"-v{host_hf}:/root/.cache/huggingface/:z"
+    conman_run = conman.copy()
+    conman_run.extend([
+        "run", "--rm", "-it", "--security-opt=label=disable",
+        f"-v{os.path.expanduser('~')}:{os.path.expanduser('~')
+                                       }", "-v/tmp:/tmp", vol
+    ])
 
-pull_cli() {
-  local image_name="$1"
+    ngl = False
+    if os.path.exists("/proc/driver/nvidia/gpus") or available("nvidia-smi"):
+        conman_run.extend(["--gpus=all", "--device", "nvidia.com/gpu=all"])
+    elif os.path.exists("/dev/kfd"):
+        for i in os.listdir('/sys/bus/pci/devices/'):
+            if os.path.exists(f'/sys/bus/pci/devices/{i}/mem_info_vram_total') and int(open(f'/sys/bus/pci/devices/{i}/mem_info_vram_total').read()) > 600000000:
+                conman_run.extend(["--device", "/dev/kfd"])
+                add_dri(conman_run)
+                ngl = True
+                break
+    elif os.uname().machine == "aarch64":
+        add_dri(conman_run)
+        ngl = True
 
-  run_prep
-  check_if_in_hf_db
-}
+    return conman_run, vol, ngl
 
-serve_usage() {
-  echo "Usage:"
-  echo "  $(basename "$0") serve MODEL"
-  echo
-  echo "Aliases:"
-  echo "  serve, start"
-  echo
-  echo "Environment Variables:"
-  echo "  PODMAN_LLM_HOST  The host:port to bind to (default \"0.0.0.0:8080\")"
 
-  return 1
-}
+def rm_cli(conman, conman_run, image_name):
+    model = get_model(conman, image_name)
+    # Completion of the delete directory logic is needed here
+    subprocess.run([conman, "rmi", "-f", image_name])
+    dangling_images = get_dangling_images(conman)
+    if dangling_images:
+        subprocess.run([conman, "rmi", "-f"] + dangling_images)
 
-run_usage() {
-  echo "Usage:"
-  echo "  $(basename "$0") run MODEL"
 
-  return 1
-}
+def build_cli(conman, image_name):
+    conman_run, vol, ngl = run_prep(conman)
+    subprocess.run([conman, "build", vol, "-t", image_name, "."])
 
-run_cli() {
-  shift 1
-  if [ "$#" -lt 1 ]; then
-    run_usage
-  fi
 
-  local dryrun="false"
-  while [ $# -gt 0 ]; do
-    case $1 in
-      -d|--dryrun)
-        dryrun="true"
-        shift 1
-        ;;
-      -*)
-        run_usage
-        ;;
-      *)
-        local image_name="$1"
-        shift # past argument
-        ;;
-    esac
-  done
+def serve_cli(conman, args):
+    if len(args) < 1:
+        serve_usage()
 
-  run_prep
-  check_if_in_hf_db
-  local model
-  model="$(get_model)"
-  conman_run+=("$image_name" "llama-main" "-m" "$model" "--log-disable")
-  conman_run+=("--instruct")
-  if $ngl; then
-    conman_run+=("-ngl" "999")
-  fi
+    dryrun = False
+    image_name = None
 
-  if $dryrun; then
-    echo "${conman_run[@]}"
-    return 0
-  fi
+    while args:
+        arg = args.pop(0)
+        if arg in ["-d", "--dryrun"]:
+            dryrun = True
+        elif arg.startswith("-"):
+            serve_usage()
+        else:
+            image_name = arg
 
-  exec "${conman_run[@]}"
-}
+    if image_name is None:
+        serve_usage()
 
-conman_cli() {
-  conman=("$1" "--root" "$llm_store")
-  shift 1
-  exec "${conman[@]}" "$@"
-}
+    conman_run, vol, ngl = run_prep(conman)
+    check_if_in_hf_db(conman, conman_run, vol, image_name)
+    model = get_model(conman, image_name)
+    conman_run.extend(["-p", f"{os.getenv('PODMAN_LLM_HOST', '8080')}:8080", image_name, "llama-server", "-m", model])
+    if dryrun:
+        print(" ".join(conman_run))
+        return
 
-usage() {
-  echo "Usage:"
-  echo "  $(basename "$0") COMMAND"
-  echo
-  echo "Commands:"
-  echo "  run MODEL        Run a model"
-  echo "  pull MODEL       Pull a model"
-  echo "  serve MODEL      Serve a model"
-  echo "  list             List models"
-  echo "  rm MODEL         Remove a model"
-  echo "  build MODEL      Build a model from a Containerfile"
+    subprocess.run(conman_run)
 
-  return 1
-}
 
-main() {
-  set -eu -o pipefail
+def get_llm_store():
+    if os.geteuid() == 0:
+        return "/var/lib/podman-llm/storage"
+    else:
+        return os.path.expanduser("~/.local/share/podman-llm/storage")
 
-  local conman_bin
-  select_container_manager
-  local llm_store
-  get_llm_store
-  local conman=("$conman_bin" "--root" "$llm_store")
-  local conman_run
-  local vol
-  local ngl="false"
-  if [ "$#" -lt 1 ]; then
-    usage
-  fi
 
-  if [ "$1" = "run" ]; then
-    run_cli "$@"
-  elif [ "$1" = "pull" ]; then
-    pull_cli "$2"
-  elif [ "$1" = "serve" ] || [ "$1" = "start" ]; then
-    serve_cli "$@"
-  elif [ "$1" = "podman" ] || [ "$1" = "docker" ]; then
-    conman_cli "$@"
-  elif [ "$1" = "list" ] || [ "$1" = "ls" ]; then
-    exec "${conman[@]}" images -flabel=MODEL
-  elif [ "$1" = "rm" ]; then
-    rm_cli "$2"
-  elif [ "$1" = "build" ]; then
-    build_cli "$2"
-  else
-    usage
-  fi
-}
+def pull_cli(conman, image_name):
+    conman_run, vol, ngl = run_prep(conman)
+    check_if_in_hf_db(conman, conman_run, vol, image_name)
 
-main "$@"
 
+def serve_usage():
+    print(
+        "Usage:\n"
+        f"  {os.path.basename(__file__)} serve MODEL\n\n"
+        "Aliases:\n"
+        "  serve, start\n\n"
+        "Environment Variables:\n"
+        "  PODMAN_LLM_HOST  The host:port to bind to (default \"0.0.0.0:8080\")"
+    )
+    sys.exit(1)
+
+
+def run_usage():
+    print("Usage:\n"
+          f"  {os.path.basename(__file__)} run MODEL\n")
+    sys.exit(1)
+
+
+def run_cli(conman, args):
+    if len(args) < 1:
+        run_usage()
+
+    dryrun = False
+    image_name = None
+    while args:
+        arg = args.pop(0)
+        if arg in ["-d", "--dryrun"]:
+            dryrun = True
+        elif arg.startswith("-"):
+            run_usage()
+        else:
+            image_name = arg
+
+    if image_name is None:
+        run_usage()
+
+    conman_run, vol, ngl = run_prep(conman)
+    check_if_in_hf_db(conman, conman_run, vol, image_name)
+    model = get_model(conman, image_name)
+    conman_run.extend([image_name, "llama-main", "-m",
+                      model, "--log-disable", "--instruct"])
+    if ngl:
+        conman_run.extend(["-ngl", "999"])
+
+    if dryrun:
+        print(" ".join(map(str, conman_run)))
+        return
+
+    subprocess.run(conman_run)
+
+
+def conman_cli(conman, args):
+    subprocess.run([conman, "--root", get_llm_store()] + args)
+
+
+def usage():
+    print(
+        "Usage:\n"
+        f"  {os.path.basename(__file__)} COMMAND\n\n"
+        "Commands:\n"
+        "  run MODEL        Run a model\n"
+        "  pull MODEL       Pull a model\n"
+        "  serve MODEL      Serve a model\n"
+        "  list             List models\n"
+        "  rm MODEL         Remove a model\n"
+        "  build MODEL      Build a model from a Containerfile")
+    sys.exit(1)
+
+
+def main(args):
+    conman = [select_container_manager(), "--root", get_llm_store()]
+    if len(args) < 1:
+        usage()
+
+    command = args.pop(0)
+    if command == "run":
+        run_cli(conman, args)
+    elif command == "pull":
+        pull_cli(conman, args[0])
+    elif command in ["serve", "start"]:
+        serve_cli(conman, args)
+    elif command in ["podman", "docker"]:
+        conman_cli(conman, args)
+    elif command in ["list", "ls"]:
+        subprocess.run([conman, "images", "-flabel=MODEL"])
+    elif command == "rm":
+        # `None` is a placeholder for conman_run which is not used in rm_cli
+        rm_cli(conman, None, args[0])
+    elif command == "build":
+        build_cli(conman, args[0])
+    else:
+        usage()
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
