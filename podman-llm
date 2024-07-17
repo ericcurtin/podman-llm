@@ -21,9 +21,7 @@ def select_container_manager():
 
 
 def image_available(conman, image_name):
-    images = conman.copy()
-    images.extend(["images", "-q", image_name])
-    result = subprocess.run(images,
+    result = subprocess.run(conman + ["images", "-q", image_name],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return bool(result.stdout.strip())
 
@@ -36,16 +34,20 @@ def wcurl(url):
     return result.stdout.decode('utf-8')
 
 
-def check_if_in_hf_db(conman, conman_run, vol, image_name):
+def check_if_in_hf_db(conman, vol, image_name):
     host = "raw.githubusercontent.com"
     url = f"https://{host}/ericcurtin/podman-llm/main/hf-db/{image_name}"
     if not image_available(conman, image_name):
         image_data = wcurl(url)
         if image_data:
-            hf_repo = [line.split()[1] for line in image_data.splitlines()
-                       if line.startswith("hf-repo")][0]
-            model = [line.split()[1] for line in image_data.splitlines()
-                     if line.startswith("model")][0]
+            for line in image_data.splitlines():
+                print(f"{line}")
+                key, value = line.split(maxsplit=1)
+                if key == "hf-repo":
+                    hf_repo = value.strip()
+                elif key == "model":
+                    model = value.strip()
+
             containerfile = (
                 f"FROM quay.io/podman-llm/podman-llm:latest\n"
                 f"RUN huggingface-cli download {hf_repo} {model}\n"
@@ -55,21 +57,18 @@ def check_if_in_hf_db(conman, conman_run, vol, image_name):
             )
             with tempfile.NamedTemporaryFile(mode='w', delete=False) as tmpfile:
                 tmpfile.write(containerfile)
-            subprocess.run([conman, "build", vol, "-t",
+            subprocess.run(conman + ["build", vol, "-t",
                            image_name, tmpfile.name])
 
 
 def get_model(conman, image_name):
-    inspect = conman.copy()
-    inspect.extend(
-        ["inspect", "-f", '{{ index .Config.Labels "MODEL"}}', image_name])
     result = subprocess.run(
-        inspect, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        conman + ["inspect", "-f", '{{ index .Config.Labels "MODEL"}}', image_name], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return result.stdout.decode('utf-8').strip()
 
 
 def get_dangling_images(conman):
-    result = subprocess.run([conman, "images", "--filter", "dangling=true",
+    result = subprocess.run(conman + ["images", "--filter", "dangling=true",
                             "-q", "--no-trunc"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return result.stdout.decode('utf-8').splitlines()
 
@@ -117,18 +116,17 @@ def run_prep(conman):
     return conman_run, vol, ngl
 
 
-def rm_cli(conman, conman_run, image_name):
+def rm_cli(conman, image_name):
     model = get_model(conman, image_name)
-    # Completion of the delete directory logic is needed here
-    subprocess.run([conman, "rmi", "-f", image_name])
+    subprocess.run(conman + ["rmi", "-f", image_name])
     dangling_images = get_dangling_images(conman)
     if dangling_images:
-        subprocess.run([conman, "rmi", "-f"] + dangling_images)
+        subprocess.run(conman + ["rmi", "-f"] + dangling_images)
 
 
 def build_cli(conman, image_name):
     conman_run, vol, ngl = run_prep(conman)
-    subprocess.run([conman, "build", vol, "-t", image_name, "."])
+    subprocess.run(conman + ["build", vol, "-t", image_name, "."])
 
 
 def serve_cli(conman, args):
@@ -151,7 +149,7 @@ def serve_cli(conman, args):
         serve_usage()
 
     conman_run, vol, ngl = run_prep(conman)
-    check_if_in_hf_db(conman, conman_run, vol, image_name)
+    check_if_in_hf_db(conman, vol, image_name)
     model = get_model(conman, image_name)
     conman_run.extend(["-p", f"{os.getenv('PODMAN_LLM_HOST', '8080')}:8080", image_name, "llama-server", "-m", model])
     if dryrun:
@@ -170,7 +168,7 @@ def get_llm_store():
 
 def pull_cli(conman, image_name):
     conman_run, vol, ngl = run_prep(conman)
-    check_if_in_hf_db(conman, conman_run, vol, image_name)
+    check_if_in_hf_db(conman, vol, image_name)
 
 
 def serve_usage():
@@ -187,7 +185,7 @@ def serve_usage():
 
 def run_usage():
     print("Usage:\n"
-          f"  {os.path.basename(__file__)} run MODEL\n")
+          f"  {os.path.basename(__file__)} run MODEL")
     sys.exit(1)
 
 
@@ -210,7 +208,7 @@ def run_cli(conman, args):
         run_usage()
 
     conman_run, vol, ngl = run_prep(conman)
-    check_if_in_hf_db(conman, conman_run, vol, image_name)
+    check_if_in_hf_db(conman, vol, image_name)
     model = get_model(conman, image_name)
     conman_run.extend([image_name, "llama-main", "-m",
                       model, "--log-disable", "--instruct"])
@@ -225,7 +223,7 @@ def run_cli(conman, args):
 
 
 def conman_cli(conman, args):
-    subprocess.run([conman, "--root", get_llm_store()] + args)
+    subprocess.run(conman + ["--root", get_llm_store()] + args)
 
 
 def usage():
@@ -257,10 +255,9 @@ def main(args):
     elif command in ["podman", "docker"]:
         conman_cli(conman, args)
     elif command in ["list", "ls"]:
-        subprocess.run([conman, "images", "-flabel=MODEL"])
+        subprocess.run(conman + ["images", "-flabel=MODEL"])
     elif command == "rm":
-        # `None` is a placeholder for conman_run which is not used in rm_cli
-        rm_cli(conman, None, args[0])
+        rm_cli(conman, args[0])
     elif command == "build":
         build_cli(conman, args[0])
     else:
